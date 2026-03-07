@@ -102,6 +102,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
+interim = { version = "0.2", features = ["chrono_0_4"] }
 cron = "0.15"
 
 # Interactive CLI prompts

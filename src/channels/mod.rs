@@ -436,7 +436,10 @@ fn build_channel_system_prompt(
              reply_target={reply_target}. When scheduling delayed messages or reminders \
              via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
              \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
-             reaches the user."
+             reaches the user. IMPORTANT: For one-time delayed messages (e.g., 'in 5 minutes'), \
+             use schedule={{\"kind\":\"in\",\"in\":\"5 minutes\"}} (natural language, no timestamp needed). \
+             Supported units: second(s), minute(s), hour(s), day(s), week(s), month(s), year(s). \
+             Use schedule={{\"kind\":\"every\",...}} ONLY for repeating tasks."
         );
         prompt.push_str(&context);
     }

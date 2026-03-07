@@ -69,6 +69,10 @@ pub enum Schedule {
     At {
         at: DateTime<Utc>,
     },
+    In {
+        #[serde(rename = "in")]
+        in_: String,
+    },
     Every {
         every_ms: u64,
     },

@@ -40,7 +40,7 @@ pub fn add_shell_job(
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
 
-    let delete_after_run = matches!(schedule, Schedule::At { .. });
+    let delete_after_run = matches!(schedule, Schedule::At { .. } | Schedule::In { .. });
 
     with_connection(config, |conn| {
         conn.execute(

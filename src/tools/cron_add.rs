@@ -54,11 +54,14 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
-         Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost), set \
-         delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
-         This is the preferred tool for sending scheduled/delayed messages to users via channels."
+        "Create a scheduled cron job (shell or agent). \
+         Schedule types: \
+         - {kind:'in',in:'<delay>'} for one-time delayed tasks (e.g., {kind:'in',in:'5 minutes'}). Units: second, minute, hour, day, week, month, year. \
+         - {kind:'at',at:'<ISO8601>'} for one-time at exact time (e.g., {kind:'at',at:'2026-03-07T17:00:00Z'}). \
+         - {kind:'every',every_ms:<ms>} for repeating tasks (e.g., 'every hour' -> every_ms:3600000). \
+         - {kind:'cron',expr:'<cron>'} for cron schedules (e.g., 'daily 9am' -> expr:'0 9 * * *'). \
+         For delayed messages, prefer {kind:'in',in:'5 minutes'} over calculating timestamps. \
+         To deliver output to a channel: delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -68,7 +71,7 @@ impl Tool for CronAddTool {
                 "name": { "type": "string" },
                 "schedule": {
                     "type": "object",
-                    "description": "Schedule object: {kind:'cron',expr,tz?} | {kind:'at',at} | {kind:'every',every_ms}"
+                    "description": "Schedule: {kind:'in',in:'5 minutes'} | {kind:'at',at:'2026-03-07T17:00:00Z'} | {kind:'every',every_ms:60000} | {kind:'cron',expr:'0 9 * * *'}. Units for 'in': second(s), minute(s), hour(s), day(s), week(s), month(s), year(s)."
                 },
                 "job_type": { "type": "string", "enum": ["shell", "agent"] },
                 "command": { "type": "string" },
@@ -149,7 +152,8 @@ impl Tool for CronAddTool {
             }
         };
 
-        let default_delete_after_run = matches!(schedule, Schedule::At { .. });
+        let default_delete_after_run =
+            matches!(schedule, Schedule::At { .. } | Schedule::In { .. });
         let delete_after_run = args
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
@@ -249,24 +253,72 @@ impl Tool for CronAddTool {
         };
 
         match result {
-            Ok(job) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "id": job.id,
-                    "name": job.name,
-                    "job_type": job.job_type,
-                    "schedule": job.schedule,
-                    "next_run": job.next_run,
-                    "enabled": job.enabled
-                }))?,
-                error: None,
-            }),
+            Ok(job) => {
+                let now = chrono::Utc::now();
+                let delay_secs = (job.next_run - now).num_seconds().max(0);
+                let delay_human = format_delay_human(delay_secs);
+
+                let is_repeating =
+                    !matches!(job.schedule, Schedule::At { .. } | Schedule::In { .. });
+                let warnings: Vec<&str> = if job.delete_after_run && is_repeating {
+                    vec!["delete_after_run=true has no effect for repeating schedules (every/cron). Use kind:'in' or kind:'at' for one-time tasks."]
+                } else {
+                    vec![]
+                };
+
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({
+                        "id": job.id,
+                        "name": job.name,
+                        "job_type": job.job_type,
+                        "schedule": job.schedule,
+                        "is_repeating": is_repeating,
+                        "next_run": job.next_run,
+                        "delay_seconds": delay_secs,
+                        "delay_human": delay_human,
+                        "delete_after_run": job.delete_after_run,
+                        "warnings": warnings,
+                        "enabled": job.enabled
+                    }))?,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
             }),
         }
+    }
+}
+
+fn format_delay_human(secs: i64) -> String {
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+
+    if days > 0 {
+        let remainder = hours % 24;
+        if remainder > 0 {
+            format!("{} days {} hours", days, remainder)
+        } else {
+            format!("{} day{}", days, if days == 1 { "" } else { "s" })
+        }
+    } else if hours > 0 {
+        let remainder = mins % 60;
+        if remainder > 0 {
+            format!("{} hours {} minutes", hours, remainder)
+        } else {
+            format!("{} hour{}", hours, if hours == 1 { "" } else { "s" })
+        }
+    } else if mins > 0 {
+        format!("{} minute{}", mins, if mins == 1 { "" } else { "s" })
+    } else {
+        format!("{} second{}", secs, if secs == 1 { "" } else { "s" })
     }
 }
 

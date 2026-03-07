@@ -251,7 +251,7 @@ async fn persist_job_result(
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
-    job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
+    job.delete_after_run && matches!(job.schedule, Schedule::At { .. } | Schedule::In { .. })
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
@@ -270,7 +270,7 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
                 _ => false,
             }
         }
-        Schedule::At { .. } => false,
+        Schedule::At { .. } | Schedule::In { .. } => false,
     };
 
     if too_frequent {
