@@ -3719,6 +3719,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     listen_to_bots: false,
                     mention_only: false,
+                    enable_slash_commands: true,
                 });
             }
             ChannelMenuChoice::Slack => {

@@ -331,6 +331,7 @@ pub(crate) async fn deliver_announcement(
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
+                false,
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }

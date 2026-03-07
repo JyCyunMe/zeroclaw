@@ -2798,6 +2798,14 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// Enable native Discord slash commands (/models, /model, /new, /bind).
+    /// When enabled, the bot will register these commands on startup.
+    #[serde(default = "default_discord_slash_commands")]
+    pub enable_slash_commands: bool,
+}
+
+fn default_discord_slash_commands() -> bool {
+    true
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -5526,6 +5534,7 @@ tool_dispatcher = "xml"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            enable_slash_commands: true,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -5541,6 +5550,7 @@ tool_dispatcher = "xml"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            enable_slash_commands: true,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
