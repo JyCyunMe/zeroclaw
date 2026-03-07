@@ -11,16 +11,150 @@ pub use discord_slash::types;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use reqwest::StatusCode;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 const DISCORD_BIND_COMMAND: &str = "/bind";
+
+// ── Discord Rate Limit Handling ─────────────────────────────────────────────
+
+/// Discord API rate limit response structure.
+/// See: https://discord.com/developers/docs/topics/rate-limits
+#[derive(Debug, Deserialize)]
+struct DiscordRateLimitBody {
+    /// The number of seconds to wait before submitting another request.
+    retry_after: Option<f64>,
+    /// Whether this is a global rate limit.
+    #[allow(dead_code)]
+    global: Option<bool>,
+    /// Human-readable message.
+    #[allow(dead_code)]
+    message: Option<String>,
+}
+
+/// Extract retry_after value from response body and headers.
+/// Priority: JSON body > Retry-After header > None
+fn extract_retry_after(body: &str, headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    // Priority 1: Try to parse JSON body for retry_after
+    if let Ok(rate_limit) = serde_json::from_str::<DiscordRateLimitBody>(body) {
+        if let Some(retry_after) = rate_limit.retry_after {
+            if retry_after.is_finite() && retry_after > 0.0 {
+                tracing::debug!(
+                    retry_after_secs = retry_after,
+                    source = "json_body",
+                    "Discord rate limit: extracted retry_after from JSON body"
+                );
+                return Some(retry_after);
+            }
+        }
+    }
+
+    // Priority 2: Try Retry-After header
+    if let Some(header_value) = headers.get(reqwest::header::RETRY_AFTER) {
+        if let Ok(header_str) = header_value.to_str() {
+            // Retry-After can be either seconds (integer) or HTTP date
+            // Discord uses seconds as integer
+            if let Ok(secs) = header_str.parse::<f64>() {
+                if secs.is_finite() && secs > 0.0 {
+                    tracing::debug!(
+                        retry_after_secs = secs,
+                        source = "header",
+                        "Discord rate limit: extracted retry_after from header"
+                    );
+                    return Some(secs);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Maximum retry attempts for rate-limited requests.
+const DISCORD_MAX_RATE_LIMIT_RETRIES: u32 = 3;
+
+/// Maximum wait time for retry_after (cap at 30 seconds to avoid indefinite waits).
+const DISCORD_MAX_RETRY_AFTER_SECS: f64 = 30.0;
+
+/// Execute a Discord API request with automatic rate limit handling.
+///
+/// On 429 responses:
+/// 1. Extract retry_after from JSON body (priority)
+/// 2. Fall back to Retry-After header
+/// 3. Use exponential backoff if neither is available
+///
+/// Returns the response for successful requests, or the final error after retries exhausted.
+async fn discord_request_with_retry(
+    request_builder: reqwest::RequestBuilder,
+    context: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let mut backoff_ms: u64 = 1000; // Base backoff: 1 second
+
+    for attempt in 0..=DISCORD_MAX_RATE_LIMIT_RETRIES {
+        let request = request_builder
+            .try_clone()
+            .context("Cannot clone request for retry")?;
+
+        let resp = request
+            .send()
+            .await
+            .context("Discord HTTP request failed")?;
+
+        // Not rate-limited, return response for caller to handle
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            return Ok(resp);
+        }
+
+        // Rate limited (429) - need to read body for retry_after
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.text().await.unwrap_or_default();
+
+        let retry_after_secs = extract_retry_after(&body, &headers);
+
+        let wait_secs = if let Some(secs) = retry_after_secs {
+            // Use retry_after, but cap at maximum
+            secs.min(DISCORD_MAX_RETRY_AFTER_SECS)
+        } else {
+            // No retry_after available, use exponential backoff
+            let backoff_secs = backoff_ms as f64 / 1000.0;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
+            backoff_secs
+        };
+
+        if attempt < DISCORD_MAX_RATE_LIMIT_RETRIES {
+            tracing::warn!(
+                context,
+                attempt = attempt + 1,
+                max_attempts = DISCORD_MAX_RATE_LIMIT_RETRIES + 1,
+                wait_secs,
+                has_retry_after = retry_after_secs.is_some(),
+                "Discord rate limited, waiting before retry"
+            );
+            tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
+        } else {
+            // Retries exhausted
+            anyhow::bail!(
+                "Discord rate limit exhausted after {} attempts ({}): {}",
+                DISCORD_MAX_RATE_LIMIT_RETRIES + 1,
+                status,
+                body.chars().take(500).collect::<String>()
+            );
+        }
+    }
+
+    // Should not reach here, but for type safety
+    anyhow::bail!("Discord request failed after retries")
+}
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -159,12 +293,12 @@ impl DiscordChannel {
             application_id
         );
 
-        let resp = client
+        let request = client
             .put(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
-            .json(&commands)
-            .send()
-            .await?;
+            .json(&commands);
+
+        let resp = discord_request_with_retry(request, "register_slash_commands").await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -176,13 +310,125 @@ impl DiscordChannel {
         Ok(())
     }
 
-    async fn handle_interaction(&self, data: &serde_json::Value) -> anyhow::Result<()> {
-        use discord_slash::{types::*, CallbackData, DiscordInteraction, InteractionCallback};
+    /// Send a deferred acknowledgment (type 5) within 3 seconds of receiving an interaction.
+    /// This shows "Bot is thinking..." to the user and allows up to 15 minutes for followup.
+    async fn send_deferred_ack(&self, interaction_id: &str, token: &str) -> anyhow::Result<()> {
+        use discord_slash::types::callback_type::DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE;
 
-        let interaction: DiscordInteraction =
+        let url =
+            format!("https://discord.com/api/v10/interactions/{interaction_id}/{token}/callback");
+
+        let body = json!({ "type": DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+
+        let request = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body);
+
+        let resp = discord_request_with_retry(request, "deferred_ack").await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to send deferred ack ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    /// Send a followup message via webhook after deferring an interaction.
+    /// Valid for up to 15 minutes after the initial deferred ack.
+    async fn send_followup_message(
+        &self,
+        application_id: &str,
+        token: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!("https://discord.com/api/v10/webhooks/{application_id}/{token}");
+
+        let body = json!({ "content": content });
+
+        let request = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body);
+
+        let resp = discord_request_with_retry(request, "followup_message").await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to send followup message ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn get_cached_models_list() -> anyhow::Result<String> {
+        let config = Self::load_config_without_env().await?;
+        let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+
+        let cache_path = config.workspace_dir.join("state").join("models_cache.json");
+
+        if !cache_path.exists() {
+            return Ok(format!(
+                "No cached models for '{provider}'. Run: `zeroclaw models refresh`"
+            ));
+        }
+
+        let raw = fs::read_to_string(&cache_path)
+            .await
+            .context("Failed to read models cache")?;
+
+        #[derive(serde::Deserialize)]
+        struct CacheEntry {
+            provider: String,
+            models: Vec<String>,
+        }
+
+        #[derive(serde::Deserialize, Default)]
+        struct CacheState {
+            entries: Vec<CacheEntry>,
+        }
+
+        let state: CacheState = serde_json::from_str(&raw).unwrap_or_default();
+
+        let entry = state.entries.iter().find(|e| e.provider == provider);
+
+        let Some(entry) = entry else {
+            return Ok(format!(
+                "No cached models for '{provider}'. Run: `zeroclaw models refresh --provider {provider}`"
+            ));
+        };
+
+        if entry.models.is_empty() {
+            return Ok(format!(
+                "Empty model cache for '{provider}'. Run: `zeroclaw models refresh --provider {provider}`"
+            ));
+        }
+
+        let mut lines = vec![format!("**{} models:**", provider)];
+        for model in &entry.models {
+            let marker = if config.default_model.as_deref() == Some(model.as_str()) {
+                "★ "
+            } else {
+                "• "
+            };
+            lines.push(format!("{marker}`{model}`"));
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    async fn handle_interaction(&self, data: &serde_json::Value) -> anyhow::Result<()> {
+        use discord_slash::types::interaction_type::APPLICATION_COMMAND;
+
+        let interaction: discord_slash::DiscordInteraction =
             serde_json::from_value(data.clone()).context("Failed to parse Discord interaction")?;
 
-        if interaction.interaction_type != interaction_type::APPLICATION_COMMAND {
+        if interaction.interaction_type != APPLICATION_COMMAND {
             return Ok(());
         }
 
@@ -190,76 +436,114 @@ impl DiscordChannel {
             return Ok(());
         };
 
-        let response_content = match cmd_data.name.as_str() {
-            "models" => {
-                use crate::channels::traits::ChannelMessage;
-                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                let msg = ChannelMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    sender: interaction.channel_id.clone(),
-                    reply_target: interaction.channel_id.clone(),
-                    content: "/models".to_string(),
-                    channel: "discord".to_string(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    thread_ts: None,
+        let cmd_name = cmd_data.name.clone();
+        let is_slow_command = cmd_name == "models";
+
+        if is_slow_command {
+            if let Err(e) = self
+                .send_deferred_ack(&interaction.id, &interaction.token)
+                .await
+            {
+                tracing::error!("Failed to defer interaction: {e}");
+                return Err(e);
+            }
+
+            let application_id = interaction.application_id.clone();
+            let token = interaction.token.clone();
+            let bot_token = self.bot_token.clone();
+
+            tokio::spawn(async move {
+                let response_content = match cmd_name.as_str() {
+                    "models" => match Self::get_cached_models_list().await {
+                        Ok(list) => list,
+                        Err(e) => {
+                            tracing::warn!("Failed to load models cache: {e}");
+                            "Failed to load models. Try `zeroclaw models refresh` first."
+                                .to_string()
+                        }
+                    },
+                    _ => "Unknown command".to_string(),
                 };
 
-                if tx.send(msg).await.is_ok() {
-                    if let Some(response) = rx.recv().await {
-                        response.content
-                    } else {
-                        "No response from agent".to_string()
+                let client = crate::config::build_runtime_proxy_client("channel.discord");
+                let url = format!("https://discord.com/api/v10/webhooks/{application_id}/{token}");
+                let body = json!({ "content": response_content });
+
+                let request = client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {bot_token}"))
+                    .json(&body);
+
+                match discord_request_with_retry(request, "followup_message").await {
+                    Ok(resp) if !resp.status().is_success() => {
+                        let status = resp.status();
+                        let err = resp.text().await.unwrap_or_default();
+                        tracing::error!("Failed to send followup ({status}): {err}");
                     }
-                } else {
-                    "Failed to send command to agent".to_string()
+                    Err(e) => {
+                        tracing::error!("Failed to send followup: {e}");
+                    }
+                    Ok(_) => {}
                 }
-            }
-            "model" => "Current model information not available in slash commands yet".to_string(),
-            "new" => "New session started".to_string(),
-            "bind" => {
-                let code = cmd_data
-                    .options
-                    .iter()
-                    .find(|o| o.name == "code")
-                    .and_then(|o| o.value.as_ref())
-                    .and_then(|v| v.as_str());
+            });
+        } else {
+            // Fast commands: respond immediately within 3 seconds
+            use discord_slash::{
+                types::callback_type::CHANNEL_MESSAGE_WITH_SOURCE, CallbackData,
+                InteractionCallback,
+            };
 
-                if let Some(code) = code {
-                    format!("Attempting to bind with code: {code}")
-                } else {
-                    "Usage: /bind <code>".to_string()
+            let response_content = match cmd_data.name.as_str() {
+                "model" => {
+                    "Current model information not available in slash commands yet".to_string()
                 }
+                "new" => "New session started".to_string(),
+                "bind" => {
+                    let code = cmd_data
+                        .options
+                        .iter()
+                        .find(|o| o.name == "code")
+                        .and_then(|o| o.value.as_ref())
+                        .and_then(|v| v.as_str());
+
+                    if let Some(code) = code {
+                        format!("Attempting to bind with code: {code}")
+                    } else {
+                        "Usage: /bind <code>".to_string()
+                    }
+                }
+                _ => "Unknown command".to_string(),
+            };
+
+            let callback = InteractionCallback {
+                callback_type: CHANNEL_MESSAGE_WITH_SOURCE,
+                data: Some(CallbackData {
+                    content: response_content,
+                }),
+            };
+
+            let url = format!(
+                "https://discord.com/api/v10/interactions/{}/{}",
+                interaction.id, interaction.token
+            );
+
+            let request = self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .json(&callback);
+
+            match discord_request_with_retry(request, "interaction_callback").await {
+                Ok(resp) if !resp.status().is_success() => {
+                    let status = resp.status();
+                    let err = resp.text().await.unwrap_or_default();
+                    tracing::error!("Failed to send interaction callback ({status}): {err}");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to send interaction callback: {e}");
+                }
+                Ok(_) => {}
             }
-            _ => "Unknown command".to_string(),
-        };
-
-        let callback = InteractionCallback {
-            callback_type: callback_type::CHANNEL_MESSAGE_WITH_SOURCE,
-            data: Some(CallbackData {
-                content: response_content,
-            }),
-        };
-
-        let client = self.http_client();
-        let url = format!(
-            "https://discord.com/api/v10/interactions/{}/{}",
-            interaction.id, interaction.token
-        );
-
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .json(&callback)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            tracing::error!("Failed to send interaction callback ({status}): {err}");
         }
 
         Ok(())
@@ -450,12 +734,12 @@ async fn send_discord_message_json(
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
     let body = json!({ "content": content });
 
-    let resp = client
+    let request = client
         .post(&url)
         .header("Authorization", format!("Bot {bot_token}"))
-        .json(&body)
-        .send()
-        .await?;
+        .json(&body);
+
+    let resp = discord_request_with_retry(request, "send_message").await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -469,6 +753,99 @@ async fn send_discord_message_json(
     Ok(())
 }
 
+/// Execute a Discord multipart request with automatic rate limit handling.
+/// Files are re-read on each retry since Form cannot be cloned.
+async fn discord_multipart_request_with_retry(
+    client: &reqwest::Client,
+    bot_token: &str,
+    url: &str,
+    content: &str,
+    files: &[PathBuf],
+    context: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let mut backoff_ms: u64 = 1000;
+
+    for attempt in 0..=DISCORD_MAX_RATE_LIMIT_RETRIES {
+        // Rebuild form on each attempt (files are re-read)
+        let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
+
+        for (idx, path) in files.iter().enumerate() {
+            match tokio::fs::read(path).await {
+                Ok(bytes) => {
+                    let filename = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("attachment.bin")
+                        .to_string();
+                    form = form.part(
+                        format!("files[{idx}]"),
+                        Part::bytes(bytes).file_name(filename),
+                    );
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        anyhow::bail!(
+                            "Discord attachment read failed for '{}': {e}",
+                            path.display()
+                        );
+                    } else {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to re-read file on retry, using previous attempt's form"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        let resp = client
+            .post(url)
+            .header("Authorization", format!("Bot {bot_token}"))
+            .multipart(form)
+            .send()
+            .await
+            .context("Discord multipart request failed")?;
+
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            return Ok(resp);
+        }
+
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.text().await.unwrap_or_default();
+        let retry_after_secs = extract_retry_after(&body, &headers);
+
+        let wait_secs = if let Some(secs) = retry_after_secs {
+            secs.min(DISCORD_MAX_RETRY_AFTER_SECS)
+        } else {
+            let backoff_secs = backoff_ms as f64 / 1000.0;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
+            backoff_secs
+        };
+
+        if attempt < DISCORD_MAX_RATE_LIMIT_RETRIES {
+            tracing::warn!(
+                context,
+                attempt = attempt + 1,
+                wait_secs,
+                "Discord multipart rate limited, retrying"
+            );
+            tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
+        } else {
+            anyhow::bail!(
+                "Discord multipart rate limit exhausted after {} attempts ({}): {}",
+                DISCORD_MAX_RATE_LIMIT_RETRIES + 1,
+                status,
+                body.chars().take(500).collect::<String>()
+            );
+        }
+    }
+
+    anyhow::bail!("Discord multipart request failed after retries")
+}
+
 async fn send_discord_message_with_files(
     client: &reqwest::Client,
     bot_token: &str,
@@ -478,32 +855,15 @@ async fn send_discord_message_with_files(
 ) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
-    let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
-
-    for (idx, path) in files.iter().enumerate() {
-        let bytes = tokio::fs::read(path).await.map_err(|error| {
-            anyhow::anyhow!(
-                "Discord attachment read failed for '{}': {error}",
-                path.display()
-            )
-        })?;
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        form = form.part(
-            format!("files[{idx}]"),
-            Part::bytes(bytes).file_name(filename),
-        );
-    }
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .multipart(form)
-        .send()
-        .await?;
+    let resp = discord_multipart_request_with_retry(
+        client,
+        bot_token,
+        &url,
+        content,
+        files,
+        "send_message_with_files",
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -766,11 +1126,12 @@ impl Channel for DiscordChannel {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
 
         // Get Gateway URL
-        let gw_resp: serde_json::Value = self
+        let request = self
             .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .send()
+            .header("Authorization", format!("Bot {}", self.bot_token));
+
+        let gw_resp: serde_json::Value = discord_request_with_retry(request, "get_gateway_url")
             .await?
             .json()
             .await?;
@@ -1162,13 +1523,13 @@ impl Channel for DiscordChannel {
     ) -> anyhow::Result<()> {
         let url = discord_reaction_url(channel_id, message_id, emoji);
 
-        let resp = self
+        let request = self
             .http_client()
             .put(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
-            .header("Content-Length", "0")
-            .send()
-            .await?;
+            .header("Content-Length", "0");
+
+        let resp = discord_request_with_retry(request, "add_reaction").await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1190,12 +1551,12 @@ impl Channel for DiscordChannel {
     ) -> anyhow::Result<()> {
         let url = discord_reaction_url(channel_id, message_id, emoji);
 
-        let resp = self
+        let request = self
             .http_client()
             .delete(&url)
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .send()
-            .await?;
+            .header("Authorization", format!("Bot {}", self.bot_token));
+
+        let resp = discord_request_with_retry(request, "remove_reaction").await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1308,7 +1669,14 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_disabled_with_nonempty_allowlist() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["12345".into()], false, false, false);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["12345".into()],
+            false,
+            false,
+            false,
+        );
         assert!(!ch.pairing_code_active());
     }
 
@@ -1865,5 +2233,74 @@ mod tests {
             rendered,
             "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
         );
+    }
+
+    // Rate limit handling tests
+
+    #[test]
+    fn extract_retry_after_from_json_body() {
+        let body =
+            r#"{"message": "You are being rate limited.", "retry_after": 17.814, "global": false}"#;
+        let headers = reqwest::header::HeaderMap::new();
+
+        let result = extract_retry_after(body, &headers);
+        assert_eq!(result, Some(17.814));
+    }
+
+    #[test]
+    fn extract_retry_after_from_header_when_body_missing() {
+        let body = r#"{"message": "Rate limited"}"#;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "65".parse().unwrap());
+
+        let result = extract_retry_after(body, &headers);
+        assert_eq!(result, Some(65.0));
+    }
+
+    #[test]
+    fn extract_retry_after_prefers_json_body_over_header() {
+        let body = r#"{"retry_after": 10.5}"#;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "999".parse().unwrap());
+
+        let result = extract_retry_after(body, &headers);
+        assert_eq!(result, Some(10.5));
+    }
+
+    #[test]
+    fn extract_retry_after_returns_none_when_both_missing() {
+        let body = r#"{"message": "Rate limited"}"#;
+        let headers = reqwest::header::HeaderMap::new();
+
+        let result = extract_retry_after(body, &headers);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_retry_after_handles_negative_retry_after() {
+        let body = r#"{"retry_after": -5.0}"#;
+        let headers = reqwest::header::HeaderMap::new();
+
+        let result = extract_retry_after(body, &headers);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_retry_after_handles_zero_retry_after() {
+        let body = r#"{"retry_after": 0}"#;
+        let headers = reqwest::header::HeaderMap::new();
+
+        let result = extract_retry_after(body, &headers);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_retry_after_handles_invalid_json() {
+        let body = r#"not valid json"#;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+
+        let result = extract_retry_after(body, &headers);
+        assert_eq!(result, Some(30.0));
     }
 }
