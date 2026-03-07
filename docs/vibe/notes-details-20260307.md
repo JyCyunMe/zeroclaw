@@ -361,3 +361,89 @@ Telegram 的 `/bind` 目前是文本匹配，可以考虑：
 - 命令权限控制
 - 自动补全支持
 - 多语言命令描述
+
+---
+
+## 6. Discord Slash Command 序列化问题：`type` 字段缺失
+
+### Problem Description
+- **File**: `src/channels/discord_slash.rs`
+- **Symptom**: Discord API 注册 slash commands 时返回 400 错误
+- **Error**: `Field "type" is required to determine the model type`
+- **Root Cause**: Rust 保留字 `type` 不能作为字段名，代码使用 `type_` 但未添加 serde 重命名
+
+### Error Log
+```
+WARN zeroclaw::channels::discord: Discord: failed to register slash commands: 
+Failed to register slash commands (400 Bad Request): 
+{"message": "Invalid Form Body", "code": 50035, "errors": {"3": {"options": {"0": {"_errors": [{"code": "TAG_FIELD_MISSING", "message": "Field \"type\" is required to determine the model type."}]}}}}}
+```
+
+### Root Cause Analysis
+Discord API 要求 JSON 字段名为 `type`，但 Rust 中 `type` 是保留字：
+
+```rust
+// 错误：序列化输出 "type_": 3
+pub struct DiscordCommandOption {
+    pub name: String,
+    pub description: String,
+    pub type_: i32,  // JSON: "type_": 3  ❌ Discord 期望 "type": 3
+}
+
+// Discord API 期望的 JSON:
+{
+  "name": "code",
+  "description": "6-digit pairing code",
+  "type": 3,           // 必须是 "type"，不是 "type_"
+  "required": true
+}
+```
+
+### Solution
+添加 `#[serde(rename = "type")]` 属性：
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordCommand {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<DiscordCommandOption>>,
+    #[serde(default, rename = "type")]  // 添加 rename
+    pub type_: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordCommandOption {
+    pub name: String,
+    pub description: String,
+    #[serde(rename = "type")]  // 添加 rename
+    pub type_: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+```
+
+### Fix Verification
+修复后序列化输出：
+```json
+{
+  "name": "bind",
+  "description": "Bind your Discord account using a pairing code",
+  "options": [
+    {
+      "name": "code",
+      "description": "6-digit pairing code from operator",
+      "type": 3,
+      "required": true
+    }
+  ],
+  "type": 1
+}
+```
+
+### Key Learning
+当 Rust 字段名与外部 API 期望的 JSON 字段名不同时（尤其是保留字冲突），**必须**使用 `#[serde(rename = "...")]` 显式指定序列化名称。
+
+### Files Modified
+- `src/channels/discord_slash.rs`: 为 `DiscordCommand.type_` 和 `DiscordCommandOption.type_` 添加 serde rename
