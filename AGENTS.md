@@ -480,5 +480,136 @@ When working in fast iterative mode:
 - Keep each iteration reversible (small commits, clear rollback).
 - Validate assumptions with code search before implementing.
 - Prefer deterministic behavior over clever shortcuts.
-- Do not “ship and hope” on security-sensitive paths.
+- Do not "ship and hope" on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+
+## 13) File Deletion Standards (MANDATORY)
+
+**ALWAYS Ask User Before Deleting**:
+- 🗑️ Temporary files (e.g., `bug___ses_*`, `*.json`, `*.sh`, `*.tmp`, `target/`, Cargo artifacts)
+- 🗑️ Untracked files (shown in `git status`)
+- 🗑️ Uncommitted changes (modified but unstaged files)
+- 🗑️ ANY file deletion operation
+
+**Correct Workflow**:
+1. Discover temporary/untracked files
+2. Display file list and sizes to user
+3. Ask: **"Delete these files?"**
+4. Wait for user confirmation before executing deletion
+
+**Forbidden Actions**:
+- ❌ Delete any file without asking first
+- ❌ Delete files while performing other operations
+- ❌ Assume temporary files are safe to delete without confirmation
+
+**Examples**:
+```
+# ✅ CORRECT
+Found 3 temporary files (total 2.3 MB):
+  - target/debug/build/foo-12345/session_symbols
+  - target/.rustc_info.json
+  - bug___ses_abc123.json
+
+Delete these files? [Y/n]
+
+# ❌ WRONG - No confirmation
+Removing 3 temporary files...
+```
+
+## 14) Development Notes Standards
+
+### Recording Principles
+
+**Core Criterion**: Record based on problem frequency and impact.
+
+| Problem Type | Frequency | Impact | Recording Location |
+|--------------|-----------|--------|-------------------|
+| Core Issues | High (≥3 times) | High | `docs/vibe/notes.md` |
+| Important Details | Low (1-2 times) | High | Code comments or README.md |
+| Temporary Issues | Occasional | Medium/Low | `docs/vibe/notes-details-YYYYMMDD.md` |
+
+### Core/High-Frequency Issues → Upgrade to Standards
+
+**Trigger Conditions**:
+- Same problem has occurred 3+ times
+- Affects architecture design, code style, or development workflow
+- Team members repeatedly ask the same questions
+
+**Handling Process**:
+1. First record to `docs/vibe/notes.md` (append by date)
+2. Once stable, upgrade to standard: write to AGENTS.md or create independent spec file
+3. Standard format must include: scenario description, solution, example code
+
+**Example**:
+```rust
+// ❌ WRONG: High-frequency issues still in comments
+// Note: Always check SecurityPolicy before file operations
+
+// ✅ CORRECT: Upgrade to standard (write to AGENTS.md)
+// [AGENTS.md → src/security → Policy Enforcement]
+// - Always validate paths against SecurityPolicy forbidden_paths
+```
+
+### Detail/Low-Frequency Issues → Note Recording
+
+**Trigger Conditions**:
+- Only occurred 1-2 times, but high impact
+- Technical details, configurations, edge cases
+- Specific scenario solutions
+
+**Recommended Locations**:
+- **In-code comments**: Near problem location, use block comments
+- **README.md**: Project-specific config notes, caveats
+- **File header**: File-level special instructions
+
+**Suggested Format**:
+```rust
+/// [DETAIL NOTE] YYYY-MM-DD
+///
+/// Problem: USB serial device path changes on macOS after sleep/wake.
+/// Scenario: STM32 Nucleo reconnect causes /dev/tty.usbmodem* path increment.
+/// Solution: Use serial number in udev rules or re-enumerate on error.
+/// Impact: Affects src/peripherals/serial.rs device detection.
+Peripheral { ... }
+```
+
+### Temporary Tracking → Git/Issue
+
+**Applicable Scenarios**:
+- Outstanding technical debt
+- Occasional performance issues
+- Unknown problems needing future investigation
+
+**Recommended Methods**:
+- Daily notes to `docs/vibe/notes-details-YYYYMMDD.md`
+- Git commit message: `TODO: ...`
+- Create Issue tagged `technical-debt`
+- Mark in code: `// FIXME: ...` + Issue URL
+
+**Daily Note Format**:
+```markdown
+# Problem Fix Notes
+
+## Date: YYYY-MM-DD
+
+---
+
+## 1. [Problem Title]
+
+### Problem Description
+- **File**: `src/xxx.rs`
+- **Symptom**: [Description]
+- **Root Cause**: [Analysis]
+
+### Solution
+- [Step 1]
+- [Step 2]
+
+---
+```
+
+### Updates and Maintenance
+
+- **Quarterly review**: Check if notes need upgrade to standards
+- **Delete outdated notes**: Remove resolved or standardized content
+- **Standardization**: Migrate stable patterns from notes to formal docs
