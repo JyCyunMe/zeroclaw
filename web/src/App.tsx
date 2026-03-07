@@ -12,22 +12,20 @@ import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import { AuthProvider, useAuth } from './hooks/useAuth';
-import { setLocale, type Locale } from './lib/i18n';
+import { setLocale, getLocale, type Locale } from './lib/i18n';
 
-// Locale context
 interface LocaleContextType {
-  locale: string;
-  setAppLocale: (locale: string) => void;
+  locale: Locale;
+  setAppLocale: (locale: Locale) => void;
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: 'en',
   setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
 
-// Pairing dialog component
 function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
@@ -81,11 +79,11 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('tr');
+  const [locale, setLocaleState] = useState<Locale>(getLocale());
 
-  const setAppLocale = (newLocale: string) => {
+  const setAppLocale = (newLocale: Locale) => {
     setLocaleState(newLocale);
-    setLocale(newLocale as Locale);
+    setLocale(newLocale);
   };
 
   // Listen for 401 events to force logout

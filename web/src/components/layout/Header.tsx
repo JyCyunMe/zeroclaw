@@ -1,6 +1,6 @@
 import { useLocation } from 'react-router-dom';
-import { LogOut } from 'lucide-react';
-import { t } from '@/lib/i18n';
+import { LogOut, Globe } from 'lucide-react';
+import { t, getSupportedLocales, type Locale } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 
@@ -17,6 +17,12 @@ const routeTitles: Record<string, string> = {
   '/doctor': 'nav.doctor',
 };
 
+const localeLabels: Record<Locale, string> = {
+  en: 'English',
+  'zh-CN': '简体中文',
+  tr: 'Türkçe',
+};
+
 export default function Header() {
   const location = useLocation();
   const { logout } = useAuth();
@@ -25,27 +31,32 @@ export default function Header() {
   const titleKey = routeTitles[location.pathname] ?? 'nav.dashboard';
   const pageTitle = t(titleKey);
 
-  const toggleLanguage = () => {
-    setAppLocale(locale === 'en' ? 'tr' : 'en');
+  const handleLocaleChange = (newLocale: Locale) => {
+    setAppLocale(newLocale);
   };
 
   return (
     <header className="h-14 bg-gray-800 border-b border-gray-700 flex items-center justify-between px-6">
-      {/* Page title */}
       <h1 className="text-lg font-semibold text-white">{pageTitle}</h1>
 
-      {/* Right-side controls */}
       <div className="flex items-center gap-4">
-        {/* Language switcher */}
-        <button
-          type="button"
-          onClick={toggleLanguage}
-          className="px-3 py-1 rounded-md text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
-        >
-          {locale === 'en' ? 'EN' : 'TR'}
-        </button>
+        <div className="relative">
+          <div className="flex items-center gap-1 px-3 py-1 rounded-md text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors cursor-pointer">
+            <Globe className="h-4 w-4" />
+            <select
+              value={locale}
+              onChange={(e) => handleLocaleChange(e.target.value as Locale)}
+              className="appearance-none bg-transparent cursor-pointer focus:outline-none"
+            >
+              {getSupportedLocales().map((loc) => (
+                <option key={loc} value={loc} className="bg-gray-800">
+                  {localeLabels[loc]}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
 
-        {/* Logout */}
         <button
           type="button"
           onClick={logout}

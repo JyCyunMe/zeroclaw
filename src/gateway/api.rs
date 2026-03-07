@@ -92,7 +92,7 @@ pub async fn handle_api_status(
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
         "gateway_port": config.gateway.port,
-        "locale": "en",
+        "locale": config.locale,
         "memory_backend": state.mem.name(),
         "paired": state.pairing.is_paired(),
         "channels": channels,

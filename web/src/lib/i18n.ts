@@ -5,7 +5,9 @@ import { getStatus } from './api';
 // Translation dictionaries
 // ---------------------------------------------------------------------------
 
-export type Locale = 'en' | 'tr';
+export type Locale = 'en' | 'zh-CN' | 'tr';
+
+const LOCALE_STORAGE_KEY = 'zeroclaw-locale';
 
 const translations: Record<Locale, Record<string, string>> = {
   en: {
@@ -189,6 +191,175 @@ const translations: Record<Locale, Record<string, string>> = {
     'health.pid': 'Process ID',
     'health.uptime': 'Uptime',
     'health.updated_at': 'Last Updated',
+  },
+
+  'zh-CN': {
+    'nav.dashboard': '仪表盘',
+    'nav.agent': '智能体',
+    'nav.tools': '工具',
+    'nav.cron': '定时任务',
+    'nav.integrations': '集成',
+    'nav.memory': '记忆',
+    'nav.config': '配置',
+    'nav.cost': '费用统计',
+    'nav.logs': '日志',
+    'nav.doctor': '诊断',
+
+    'dashboard.title': '仪表盘',
+    'dashboard.provider': '提供商',
+    'dashboard.model': '模型',
+    'dashboard.uptime': '运行时间',
+    'dashboard.temperature': '温度',
+    'dashboard.gateway_port': '网关端口',
+    'dashboard.locale': '语言',
+    'dashboard.memory_backend': '记忆后端',
+    'dashboard.paired': '已配对',
+    'dashboard.channels': '频道',
+    'dashboard.health': '健康状态',
+    'dashboard.status': '状态',
+    'dashboard.overview': '概览',
+    'dashboard.system_info': '系统信息',
+    'dashboard.quick_actions': '快捷操作',
+
+    'agent.title': '智能体对话',
+    'agent.send': '发送',
+    'agent.placeholder': '输入消息...',
+    'agent.connecting': '连接中...',
+    'agent.connected': '已连接',
+    'agent.disconnected': '已断开',
+    'agent.reconnecting': '重新连接...',
+    'agent.thinking': '思考中...',
+    'agent.tool_call': '工具调用',
+    'agent.tool_result': '工具结果',
+
+    'tools.title': '可用工具',
+    'tools.name': '名称',
+    'tools.description': '描述',
+    'tools.parameters': '参数',
+    'tools.search': '搜索工具...',
+    'tools.empty': '暂无可用工具',
+    'tools.count': '工具总数',
+
+    'cron.title': '定时任务',
+    'cron.add': '添加任务',
+    'cron.delete': '删除',
+    'cron.enable': '启用',
+    'cron.disable': '禁用',
+    'cron.name': '名称',
+    'cron.command': '命令',
+    'cron.schedule': '调度',
+    'cron.next_run': '下次运行',
+    'cron.last_run': '上次运行',
+    'cron.last_status': '上次状态',
+    'cron.enabled': '已启用',
+    'cron.empty': '暂无定时任务',
+    'cron.confirm_delete': '确定要删除此任务吗？',
+
+    'integrations.title': '集成',
+    'integrations.available': '可用',
+    'integrations.active': '已激活',
+    'integrations.coming_soon': '即将推出',
+    'integrations.category': '分类',
+    'integrations.status': '状态',
+    'integrations.search': '搜索集成...',
+    'integrations.empty': '未找到集成',
+    'integrations.activate': '激活',
+    'integrations.deactivate': '停用',
+
+    'memory.title': '记忆存储',
+    'memory.search': '搜索记忆...',
+    'memory.add': '存储记忆',
+    'memory.delete': '删除',
+    'memory.key': '键',
+    'memory.content': '内容',
+    'memory.category': '分类',
+    'memory.timestamp': '时间戳',
+    'memory.session': '会话',
+    'memory.score': '分数',
+    'memory.empty': '暂无记忆条目',
+    'memory.confirm_delete': '确定要删除此记忆吗？',
+    'memory.all_categories': '全部分类',
+
+    'config.title': '配置',
+    'config.save': '保存',
+    'config.reset': '重置',
+    'config.saved': '配置保存成功',
+    'config.error': '配置保存失败',
+    'config.loading': '加载配置...',
+    'config.editor_placeholder': 'TOML 配置...',
+
+    'cost.title': '费用统计',
+    'cost.session': '会话费用',
+    'cost.daily': '今日费用',
+    'cost.monthly': '本月费用',
+    'cost.total_tokens': '总 Token',
+    'cost.request_count': '请求数',
+    'cost.by_model': '按模型统计',
+    'cost.model': '模型',
+    'cost.tokens': 'Token',
+    'cost.requests': '请求数',
+    'cost.usd': '费用 (USD)',
+
+    'logs.title': '实时日志',
+    'logs.clear': '清空',
+    'logs.pause': '暂停',
+    'logs.resume': '继续',
+    'logs.filter': '过滤日志...',
+    'logs.empty': '暂无日志',
+    'logs.connected': '已连接事件流',
+    'logs.disconnected': '已断开事件流',
+
+    'doctor.title': '系统诊断',
+    'doctor.run': '运行诊断',
+    'doctor.running': '诊断运行中...',
+    'doctor.ok': '正常',
+    'doctor.warn': '警告',
+    'doctor.error': '错误',
+    'doctor.severity': '严重程度',
+    'doctor.category': '分类',
+    'doctor.message': '消息',
+    'doctor.empty': '尚未运行诊断',
+    'doctor.summary': '诊断摘要',
+
+    'auth.pair': '配对设备',
+    'auth.pairing_code': '配对码',
+    'auth.pair_button': '配对',
+    'auth.logout': '退出登录',
+    'auth.pairing_success': '配对成功！',
+    'auth.pairing_failed': '配对失败，请重试',
+    'auth.enter_code': '输入配对码以连接智能体',
+
+    'common.loading': '加载中...',
+    'common.error': '发生错误',
+    'common.retry': '重试',
+    'common.cancel': '取消',
+    'common.confirm': '确认',
+    'common.save': '保存',
+    'common.delete': '删除',
+    'common.edit': '编辑',
+    'common.close': '关闭',
+    'common.yes': '是',
+    'common.no': '否',
+    'common.search': '搜索...',
+    'common.no_data': '暂无数据',
+    'common.refresh': '刷新',
+    'common.back': '返回',
+    'common.actions': '操作',
+    'common.name': '名称',
+    'common.description': '描述',
+    'common.status': '状态',
+    'common.created': '创建时间',
+    'common.updated': '更新时间',
+
+    'health.title': '系统健康',
+    'health.component': '组件',
+    'health.status': '状态',
+    'health.last_ok': '上次正常',
+    'health.last_error': '上次错误',
+    'health.restart_count': '重启次数',
+    'health.pid': '进程 ID',
+    'health.uptime': '运行时间',
+    'health.updated_at': '更新时间',
   },
 
   tr: {
@@ -379,7 +550,36 @@ const translations: Record<Locale, Record<string, string>> = {
 // Current locale state
 // ---------------------------------------------------------------------------
 
-let currentLocale: Locale = 'en';
+/**
+ * Get the list of supported locales.
+ */
+export function getSupportedLocales(): Locale[] {
+  return ['en', 'zh-CN', 'tr'];
+}
+
+/**
+ * Check if a locale is supported.
+ */
+export function isSupportedLocale(locale: string): locale is Locale {
+  return getSupportedLocales().includes(locale as Locale);
+}
+
+/**
+ * Get the locale stored in localStorage, or null if not set.
+ */
+function getStoredLocale(): Locale | null {
+  try {
+    const stored = localStorage.getItem(LOCALE_STORAGE_KEY);
+    if (stored && isSupportedLocale(stored)) {
+      return stored;
+    }
+  } catch {
+    // localStorage not available
+  }
+  return null;
+}
+
+let currentLocale: Locale = getStoredLocale() ?? 'en';
 
 export function getLocale(): Locale {
   return currentLocale;
@@ -387,6 +587,11 @@ export function getLocale(): Locale {
 
 export function setLocale(locale: Locale): void {
   currentLocale = locale;
+  try {
+    localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+  } catch {
+    // localStorage not available
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,14 +631,25 @@ export function useLocale(): { locale: Locale; t: (key: string) => string } {
     getStatus()
       .then((status) => {
         if (cancelled) return;
-        const detected = status.locale?.toLowerCase().startsWith('tr')
-          ? 'tr'
-          : 'en';
-        setLocale(detected);
-        setLocaleState(detected);
+        
+        const serverLocale = status.locale?.toLowerCase() ?? 'en';
+        let detected: Locale = 'en';
+        
+        if (serverLocale.startsWith('zh')) {
+          detected = 'zh-CN';
+        } else if (serverLocale.startsWith('tr')) {
+          detected = 'tr';
+        } else {
+          detected = 'en';
+        }
+        
+        if (getStoredLocale() === null) {
+          setLocale(detected);
+        }
+        setLocaleState(getLocale());
       })
       .catch(() => {
-        // Keep default locale on error
+        setLocaleState(currentLocale);
       });
 
     return () => {

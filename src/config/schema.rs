@@ -86,6 +86,10 @@ pub struct Config {
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
+    /// UI locale for the dashboard (e.g., "en", "zh-CN", "tr"). Default: `"en"`.
+    #[serde(default = "default_locale")]
+    pub locale: String,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -274,6 +278,10 @@ fn default_max_depth() -> u32 {
 
 fn default_max_tool_iterations() -> usize {
     10
+}
+
+fn default_locale() -> String {
+    "en".to_string()
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
