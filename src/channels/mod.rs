@@ -2776,6 +2776,7 @@ fn collect_configured_channels(
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
+                dc.enable_slash_commands,
             )),
         });
     }

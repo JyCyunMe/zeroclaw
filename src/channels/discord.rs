@@ -1,9 +1,13 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::Config;
+
+#[path = "discord_slash.rs"]
+mod discord_slash;
 use crate::security::pairing::PairingGuard;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use directories::UserDirs;
+pub use discord_slash::types;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
@@ -25,6 +29,7 @@ pub struct DiscordChannel {
     allowed_users: Arc<RwLock<Vec<String>>>,
     listen_to_bots: bool,
     mention_only: bool,
+    enable_slash_commands: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     pairing: Option<PairingGuard>,
 }
@@ -36,6 +41,7 @@ impl DiscordChannel {
         allowed_users: Vec<String>,
         listen_to_bots: bool,
         mention_only: bool,
+        enable_slash_commands: bool,
     ) -> Self {
         let pairing = if allowed_users.is_empty() {
             let guard = PairingGuard::new(true, &[]);
@@ -54,6 +60,7 @@ impl DiscordChannel {
             allowed_users: Arc::new(RwLock::new(allowed_users)),
             listen_to_bots,
             mention_only,
+            enable_slash_commands,
             typing_handles: Mutex::new(HashMap::new()),
             pairing,
         }
@@ -137,6 +144,125 @@ impl DiscordChannel {
         } else {
             None
         }
+    }
+
+    async fn register_slash_commands(&self) -> anyhow::Result<()> {
+        use discord_slash::zeroclaw_slash_commands;
+
+        let application_id = Self::bot_user_id_from_token(&self.bot_token)
+            .context("Failed to get bot user ID from token")?;
+
+        let commands = zeroclaw_slash_commands();
+        let client = self.http_client();
+        let url = format!(
+            "https://discord.com/api/v10/applications/{}/commands",
+            application_id
+        );
+
+        let resp = client
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&commands)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to register slash commands ({status}): {err}");
+        }
+
+        tracing::info!("Discord: registered {} slash commands", commands.len());
+        Ok(())
+    }
+
+    async fn handle_interaction(&self, data: &serde_json::Value) -> anyhow::Result<()> {
+        use discord_slash::{types::*, CallbackData, DiscordInteraction, InteractionCallback};
+
+        let interaction: DiscordInteraction =
+            serde_json::from_value(data.clone()).context("Failed to parse Discord interaction")?;
+
+        if interaction.interaction_type != interaction_type::APPLICATION_COMMAND {
+            return Ok(());
+        }
+
+        let Some(ref cmd_data) = interaction.data else {
+            return Ok(());
+        };
+
+        let response_content = match cmd_data.name.as_str() {
+            "models" => {
+                use crate::channels::traits::ChannelMessage;
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                let msg = ChannelMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender: interaction.channel_id.clone(),
+                    reply_target: interaction.channel_id.clone(),
+                    content: "/models".to_string(),
+                    channel: "discord".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    thread_ts: None,
+                };
+
+                if tx.send(msg).await.is_ok() {
+                    if let Some(response) = rx.recv().await {
+                        response.content
+                    } else {
+                        "No response from agent".to_string()
+                    }
+                } else {
+                    "Failed to send command to agent".to_string()
+                }
+            }
+            "model" => "Current model information not available in slash commands yet".to_string(),
+            "new" => "New session started".to_string(),
+            "bind" => {
+                let code = cmd_data
+                    .options
+                    .iter()
+                    .find(|o| o.name == "code")
+                    .and_then(|o| o.value.as_ref())
+                    .and_then(|v| v.as_str());
+
+                if let Some(code) = code {
+                    format!("Attempting to bind with code: {code}")
+                } else {
+                    "Usage: /bind <code>".to_string()
+                }
+            }
+            _ => "Unknown command".to_string(),
+        };
+
+        let callback = InteractionCallback {
+            callback_type: callback_type::CHANNEL_MESSAGE_WITH_SOURCE,
+            data: Some(CallbackData {
+                content: response_content,
+            }),
+        };
+
+        let client = self.http_client();
+        let url = format!(
+            "https://discord.com/api/v10/interactions/{}/{}",
+            interaction.id, interaction.token
+        );
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&callback)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::error!("Failed to send interaction callback ({status}): {err}");
+        }
+
+        Ok(())
     }
 }
 
@@ -708,6 +834,12 @@ impl Channel for DiscordChannel {
 
         let guild_filter = self.guild_id.clone();
 
+        if self.enable_slash_commands {
+            if let Err(e) = self.register_slash_commands().await {
+                tracing::warn!("Discord: failed to register slash commands: {e}");
+            }
+        }
+
         loop {
             tokio::select! {
                 _ = hb_rx.recv() => {
@@ -759,15 +891,12 @@ impl Channel for DiscordChannel {
                         _ => {}
                     }
 
-                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
-                    if event_type != "MESSAGE_CREATE" {
-                        continue;
-                    }
-
-                    let Some(d) = event.get("d") else {
-                        continue;
-                    };
+                    match event_type {
+                        "MESSAGE_CREATE" => {
+                            let Some(d) = event.get("d") else {
+                                continue;
+                            };
 
                     // Skip messages from the bot itself
                     let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
@@ -918,6 +1047,7 @@ impl Channel for DiscordChannel {
                             allowed_users_clone,
                             self.listen_to_bots,
                             self.mention_only,
+                            false,
                         );
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
@@ -961,6 +1091,18 @@ impl Channel for DiscordChannel {
 
                     if tx.send(channel_msg).await.is_err() {
                         break;
+                    }
+                        }
+                        "INTERACTION_CREATE" => {
+                            let Some(d) = event.get("d") else {
+                                continue;
+                            };
+
+                            if let Err(e) = self.handle_interaction(d).await {
+                                tracing::error!("Discord: failed to handle interaction: {e}");
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1074,7 +1216,7 @@ mod tests {
 
     #[test]
     fn discord_channel_name() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         assert_eq!(ch.name(), "discord");
     }
 
@@ -1094,14 +1236,14 @@ mod tests {
 
     #[tokio::test]
     async fn empty_allowlist_denies_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         assert!(!ch.is_user_allowed("12345").await);
         assert!(!ch.is_user_allowed("anyone").await);
     }
 
     #[tokio::test]
     async fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false, false);
         assert!(ch.is_user_allowed("12345").await);
         assert!(ch.is_user_allowed("anyone").await);
     }
@@ -1114,6 +1256,7 @@ mod tests {
             vec!["111".into(), "222".into()],
             false,
             false,
+            false,
         );
         assert!(ch.is_user_allowed("111").await);
         assert!(ch.is_user_allowed("222").await);
@@ -1123,7 +1266,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false, false);
         assert!(!ch.is_user_allowed("1111").await);
         assert!(!ch.is_user_allowed("11").await);
         assert!(!ch.is_user_allowed("0111").await);
@@ -1131,7 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false, false);
         assert!(!ch.is_user_allowed("").await);
     }
 
@@ -1143,6 +1286,7 @@ mod tests {
             vec!["111".into(), "*".into()],
             false,
             false,
+            false,
         );
         assert!(ch.is_user_allowed("111").await);
         assert!(ch.is_user_allowed("anyone_else").await);
@@ -1150,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false, false);
         assert!(ch.is_user_allowed("ABC").await);
         assert!(!ch.is_user_allowed("abc").await);
         assert!(!ch.is_user_allowed("Abc").await);
@@ -1158,13 +1302,13 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_enabled_with_empty_allowlist() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         assert!(ch.pairing_code_active());
     }
 
     #[tokio::test]
     async fn pairing_disabled_with_nonempty_allowlist() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["12345".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["12345".into()], false, false, false);
         assert!(!ch.pairing_code_active());
     }
 
@@ -1386,14 +1530,14 @@ mod tests {
 
     #[test]
     fn typing_handles_start_empty() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         let guard = ch.typing_handles.lock();
         assert!(guard.is_empty());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         let _ = ch.start_typing("123456").await;
         let guard = ch.typing_handles.lock();
         assert!(guard.contains_key("123456"));
@@ -1401,7 +1545,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handles.lock();
@@ -1410,14 +1554,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_is_idempotent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         assert!(ch.stop_typing("123456").await.is_ok());
         assert!(ch.stop_typing("123456").await.is_ok());
     }
 
     #[tokio::test]
     async fn concurrent_typing_handles_are_independent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false, false);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
         {

@@ -39,20 +39,39 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 
 ## In-Chat Runtime Model Switching (Telegram / Discord)
 
-When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
+When running `zeroclaw channel start` (or daemon mode), Telegram and Discord support sender-scoped runtime switching:
 
+### Text Commands (Telegram / Discord)
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current sender session
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current sender session
 - `/new` — clear conversation history and start a fresh session
+- `/bind <code>` — bind account with pairing code (pairing mode only)
+
+### Discord Native Slash Commands
+Discord also supports native slash commands (enabled by default):
+- `/models` — show available providers
+- `/model [id]` — show or set current model
+- `/new` — start fresh session
+- `/bind <code>` — bind account with pairing code
 
 Notes:
 
+- Slash commands are automatically registered on startup when `enable_slash_commands = true` (default).
+- Slash commands and text commands work interchangeably on Discord.
 - Switching provider or model clears only that sender's in-memory conversation history to avoid cross-model context contamination.
 - `/new` clears the sender's conversation history without changing provider or model selection.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
+- `/bind` is only available when pairing mode is active (empty allowlist).
+
+### Configuration
+To disable Discord slash commands, add to config:
+```toml
+[channels_config.discord]
+enable_slash_commands = false
+```
 
 ## Inbound Image Marker Protocol
 

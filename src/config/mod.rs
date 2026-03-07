@@ -53,6 +53,7 @@ mod tests {
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            enable_slash_commands: true,
         };
 
         let lark = LarkConfig {
