@@ -127,6 +127,15 @@ async fn execute_and_persist_job(
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
+    tracing::debug!(
+        job_id = %job.id,
+        job_type = ?job.job_type,
+        delivery_mode = %job.delivery.mode,
+        delivery_channel = ?job.delivery.channel,
+        delivery_to = ?job.delivery.to,
+        "Executing cron job"
+    );
+
     let started_at = Utc::now();
     let (success, output) = execute_job_with_retry(config, security, job).await;
     let finished_at = Utc::now();
@@ -284,6 +293,11 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
+        tracing::debug!(
+            job_id = %job.id,
+            delivery_mode = %delivery.mode,
+            "Cron job delivery mode is not 'announce', skipping"
+        );
         return Ok(());
     }
 
@@ -295,6 +309,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+
+    tracing::info!(
+        job_id = %job.id,
+        channel = %channel,
+        target = %target,
+        "Delivering cron job output to channel"
+    );
 
     deliver_announcement(config, channel, target, output).await
 }

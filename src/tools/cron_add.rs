@@ -61,7 +61,7 @@ impl Tool for CronAddTool {
          - {kind:'every',every_ms:<ms>} for repeating tasks (e.g., 'every hour' -> every_ms:3600000). \
          - {kind:'cron',expr:'<cron>'} for cron schedules (e.g., 'daily 9am' -> expr:'0 9 * * *'). \
          For delayed messages, prefer {kind:'in',in:'5 minutes'} over calculating timestamps. \
-         To deliver output to a channel: delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}."
+         Delivery will be auto-injected when called from a channel context."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -80,7 +80,7 @@ impl Tool for CronAddTool {
                 "model": { "type": "string" },
                 "delivery": {
                     "type": "object",
-                    "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
+                    "description": "Delivery config to send job output to a channel. Auto-injected when called from channel context.",
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
                         "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost"], "description": "Channel type to deliver to" },

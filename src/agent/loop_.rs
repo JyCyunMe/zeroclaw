@@ -1891,6 +1891,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -1901,6 +1902,7 @@ async fn execute_one_tool(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    channel_delivery: Option<(&str, &str)>,
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -1923,7 +1925,40 @@ async fn execute_one_tool(
         });
     };
 
-    let tool_future = tool.execute(call_arguments);
+    // Auto-inject delivery for cron_add if not provided and channel context exists
+    let final_args = if call_name == "cron_add" {
+        let has_delivery = call_arguments
+            .get("delivery")
+            .and_then(|d| d.get("mode"))
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m == "announce");
+
+        if !has_delivery {
+            if let Some((channel, target)) = channel_delivery {
+                let mut args = call_arguments.clone();
+                args["delivery"] = serde_json::json!({
+                    "mode": "announce",
+                    "channel": channel,
+                    "to": target
+                });
+                tracing::info!(
+                    tool = %call_name,
+                    channel = %channel,
+                    target = %target,
+                    "Auto-injecting delivery for cron_add"
+                );
+                args
+            } else {
+                call_arguments
+            }
+        } else {
+            call_arguments
+        }
+    } else {
+        call_arguments
+    };
+
+    let tool_future = tool.execute(final_args);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
@@ -2007,6 +2042,7 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    channel_delivery: Option<(&str, &str)>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -2017,6 +2053,7 @@ async fn execute_tools_parallel(
                 tools_registry,
                 observer,
                 cancellation_token,
+                channel_delivery,
             )
         })
         .collect();
@@ -2030,6 +2067,7 @@ async fn execute_tools_sequential(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    channel_delivery: Option<(&str, &str)>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -2041,6 +2079,7 @@ async fn execute_tools_sequential(
                 tools_registry,
                 observer,
                 cancellation_token,
+                channel_delivery,
             )
             .await?,
         );
@@ -2081,6 +2120,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    channel_delivery: Option<(&str, &str)>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2565,6 +2605,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                channel_delivery,
             )
             .await?
         } else {
@@ -2573,6 +2614,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                channel_delivery,
             )
             .await?
         };
@@ -3037,6 +3079,7 @@ pub async fn run(
             None,
             None,
             &[],
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -3159,6 +3202,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             {
@@ -3703,6 +3747,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3749,6 +3794,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3789,6 +3835,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3915,6 +3962,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3984,6 +4032,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4040,6 +4089,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");

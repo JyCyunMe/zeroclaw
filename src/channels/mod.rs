@@ -433,17 +433,14 @@ fn build_channel_system_prompt(
     if !reply_target.is_empty() {
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}. When scheduling delayed messages or reminders \
-             via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
-             \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
-             reaches the user. IMPORTANT: For one-time delayed messages (e.g., 'in 5 minutes'), \
-             use schedule={{\"kind\":\"in\",\"in\":\"5 minutes\"}} (natural language, no timestamp needed). \
+             reply_target={reply_target}. When scheduling delayed tasks via cron_add, \
+             the result will be automatically sent back to this channel. \
+             For one-time delayed messages, use schedule={{\"kind\":\"in\",\"in\":\"5 minutes\"}}. \
              Supported units: second(s), minute(s), hour(s), day(s), week(s), month(s), year(s). \
              Use schedule={{\"kind\":\"every\",...}} ONLY for repeating tasks."
         );
         prompt.push_str(&context);
     }
-
     prompt
 }
 
@@ -1732,6 +1729,11 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let channel_delivery = if msg.reply_target.is_empty() {
+        None
+    } else {
+        Some((msg.channel.as_str(), msg.reply_target.as_str()))
+    };
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -1757,6 +1759,7 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                channel_delivery,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
