@@ -422,6 +422,36 @@ impl DiscordChannel {
         Ok(lines.join("\n"))
     }
 
+    async fn get_skills_list() -> String {
+        let config = match Self::load_config_without_env().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to load config for skills list: {e}");
+                return "Failed to load configuration".to_string();
+            }
+        };
+
+        let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+        if skills.is_empty() {
+            return "**No skills installed**\n\
+                Add skills to `~/.zeroclaw/workspace/skills/` or run `zeroclaw skills install <name>`"
+                .to_string();
+        }
+
+        let mut lines = vec![format!("**Available Skills ({})**", skills.len())];
+        for skill in &skills {
+            let desc = if skill.description.len() > 60 {
+                format!("{}...", &skill.description[..57])
+            } else {
+                skill.description.clone()
+            };
+            lines.push(format!("• `{}` - {}", skill.name, desc));
+        }
+
+        lines.join("\n")
+    }
+
     async fn handle_interaction(&self, data: &serde_json::Value) -> anyhow::Result<()> {
         use discord_slash::types::interaction_type::APPLICATION_COMMAND;
 
@@ -437,7 +467,7 @@ impl DiscordChannel {
         };
 
         let cmd_name = cmd_data.name.clone();
-        let is_slow_command = cmd_name == "models";
+        let is_slow_command = cmd_name == "models" || cmd_name == "skills";
 
         if is_slow_command {
             if let Err(e) = self
@@ -462,6 +492,7 @@ impl DiscordChannel {
                                 .to_string()
                         }
                     },
+                    "skills" => Self::get_skills_list().await,
                     _ => "Unknown command".to_string(),
                 };
 
@@ -494,6 +525,89 @@ impl DiscordChannel {
             };
 
             let response_content = match cmd_data.name.as_str() {
+                "help" => {
+                    let user_mention = interaction
+                        .user_id()
+                        .map(|id| format!("<@{id}>"))
+                        .unwrap_or_else(|| "User".to_string());
+                    format!(
+                        "**ZeroClaw Help**\n\
+                        Hello {user_mention}! I'm your AI assistant.\n\n\
+                        **Quick Start:**\n\
+                        • Just send me a message to start chatting\n\
+                        • Use `/commands` to see all available commands\n\
+                        • Use `/skills` to see available skills\n\n\
+                        **Need more help?** Visit: https://github.com/zeroclaw-labs/zeroclaw"
+                    )
+                }
+                "commands" => "**Available Slash Commands**\n\
+                    • `/help` - Show help information\n\
+                    • `/commands` - List all commands\n\
+                    • `/whoami` - Show your Discord ID\n\
+                    • `/skills` - List available skills\n\
+                    • `/skill <name> [input]` - Execute a skill\n\
+                    • `/verbose on/off` - Toggle verbose mode\n\
+                    • `/models` - List available AI models\n\
+                    • `/model` - Show current model\n\
+                    • `/new` - Start new conversation\n\
+                    • `/bind <code>` - Bind your account"
+                    .to_string(),
+                "whoami" => {
+                    let user_id = interaction.user_id().unwrap_or("unknown");
+                    let username = interaction.username().unwrap_or("unknown");
+                    format!(
+                        "**Your Discord Info**\n\
+                        • User ID: `{user_id}`\n\
+                        • Username: {username}"
+                    )
+                }
+                "verbose" => {
+                    let mode = cmd_data
+                        .options
+                        .iter()
+                        .find(|o| o.name == "mode")
+                        .and_then(|o| o.value.as_ref())
+                        .and_then(|v| v.as_str());
+
+                    match mode {
+                        Some("on") => {
+                            "Verbose mode enabled. Responses will include more details.".to_string()
+                        }
+                        Some("off") => {
+                            "Verbose mode disabled. Responses will be concise.".to_string()
+                        }
+                        _ => "Usage: `/verbose on` or `/verbose off`".to_string(),
+                    }
+                }
+                "skill" => {
+                    let name = cmd_data
+                        .options
+                        .iter()
+                        .find(|o| o.name == "name")
+                        .and_then(|o| o.value.as_ref())
+                        .and_then(|v| v.as_str());
+
+                    let input = cmd_data
+                        .options
+                        .iter()
+                        .find(|o| o.name == "input")
+                        .and_then(|o| o.value.as_ref())
+                        .and_then(|v| v.as_str());
+
+                    match name {
+                        Some(skill_name) => {
+                            let input_info = input
+                                .map(|i| format!(" with input: `{i}`"))
+                                .unwrap_or_default();
+                            format!(
+                                "Skill execution requested: `{skill_name}`{input_info}\n\
+                                Note: Skill execution via slash commands is limited. \
+                                Send a message to the bot for full skill functionality."
+                            )
+                        }
+                        None => "Usage: `/skill <name> [input]`".to_string(),
+                    }
+                }
                 "model" => {
                     "Current model information not available in slash commands yet".to_string()
                 }

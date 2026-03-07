@@ -103,6 +103,42 @@ pub struct DiscordInteraction {
     pub data: Option<InteractionData>,
     pub channel_id: String,
     pub token: String,
+    #[serde(default)]
+    pub member: Option<DiscordMember>,
+    #[serde(default)]
+    pub user: Option<DiscordUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordMember {
+    pub user: Option<DiscordUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordUser {
+    pub id: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub discriminator: Option<String>,
+}
+
+impl DiscordInteraction {
+    pub fn user_id(&self) -> Option<&str> {
+        self.member
+            .as_ref()
+            .and_then(|m| m.user.as_ref())
+            .map(|u| u.id.as_str())
+            .or_else(|| self.user.as_ref().map(|u| u.id.as_str()))
+    }
+
+    pub fn username(&self) -> Option<&str> {
+        self.member
+            .as_ref()
+            .and_then(|m| m.user.as_ref())
+            .and_then(|u| u.username.as_deref())
+            .or_else(|| self.user.as_ref().and_then(|u| u.username.as_deref()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,13 +170,32 @@ pub struct CallbackData {
 /// Generate all slash commands for ZeroClaw
 pub fn zeroclaw_slash_commands() -> Vec<DiscordCommand> {
     vec![
-        // /models - List available models
+        DiscordCommand::new("help", "Show help information and usage guide"),
+        DiscordCommand::new("commands", "List all available slash commands"),
+        DiscordCommand::new("whoami", "Display your Discord user ID"),
+        DiscordCommand::new("skills", "List all available skills"),
+        DiscordCommand::new("skill", "Execute a specific skill by name").with_options(vec![
+            DiscordCommandOption::new(
+                "name",
+                "Name of the skill to execute",
+                types::option_type::STRING,
+            )
+            .required(),
+            DiscordCommandOption::new(
+                "input",
+                "Optional input for the skill",
+                types::option_type::STRING,
+            ),
+        ]),
+        DiscordCommand::new("verbose", "Toggle verbose mode for detailed responses").with_options(
+            vec![
+                DiscordCommandOption::new("mode", "on or off", types::option_type::STRING)
+                    .required(),
+            ],
+        ),
         DiscordCommand::new("models", "List available AI models"),
-        // /model - Show current model
         DiscordCommand::new("model", "Show current AI model"),
-        // /new - Start new session
         DiscordCommand::new("new", "Start a new conversation session"),
-        // /bind - Bind account with pairing code
         DiscordCommand::new("bind", "Bind your Discord account using a pairing code").with_options(
             vec![DiscordCommandOption::new(
                 "code",
@@ -181,9 +236,15 @@ mod tests {
     #[test]
     fn test_zeroclaw_commands() {
         let cmds = zeroclaw_slash_commands();
-        assert_eq!(cmds.len(), 4);
+        assert_eq!(cmds.len(), 10);
 
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"commands"));
+        assert!(names.contains(&"whoami"));
+        assert!(names.contains(&"skills"));
+        assert!(names.contains(&"skill"));
+        assert!(names.contains(&"verbose"));
         assert!(names.contains(&"models"));
         assert!(names.contains(&"model"));
         assert!(names.contains(&"new"));
