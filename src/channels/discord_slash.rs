@@ -26,13 +26,16 @@ pub mod types {
 }
 
 /// Discord Application Command structure for registration
+///
+/// Note: `type_` uses `#[serde(rename = "type")]` because `type` is a Rust reserved word,
+/// but Discord API expects the JSON field name to be exactly `"type"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordCommand {
     pub name: String,
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<DiscordCommandOption>>,
-    #[serde(default)]
+    #[serde(default, rename = "type")]
     pub type_: i32,
 }
 
@@ -53,10 +56,14 @@ impl DiscordCommand {
 }
 
 /// Discord Command Option (parameters)
+///
+/// Note: `type_` uses `#[serde(rename = "type")]` because `type` is a Rust reserved word,
+/// but Discord API expects the JSON field name to be exactly `"type"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordCommandOption {
     pub name: String,
     pub description: String,
+    #[serde(rename = "type")]
     pub type_: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
