@@ -1,22 +1,32 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::Config;
+use crate::security::pairing::PairingGuard;
+use anyhow::Context as _;
 use async_trait::async_trait;
+use directories::UserDirs;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::fs;
+use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+const DISCORD_BIND_COMMAND: &str = "/bind";
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
     bot_token: String,
     guild_id: Option<String>,
-    allowed_users: Vec<String>,
+    allowed_users: Arc<RwLock<Vec<String>>>,
     listen_to_bots: bool,
     mention_only: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    pairing: Option<PairingGuard>,
 }
 
 impl DiscordChannel {
@@ -27,13 +37,25 @@ impl DiscordChannel {
         listen_to_bots: bool,
         mention_only: bool,
     ) -> Self {
+        let pairing = if allowed_users.is_empty() {
+            let guard = PairingGuard::new(true, &[]);
+            if let Some(code) = guard.pairing_code() {
+                println!("  🔐 Discord pairing required. One-time bind code: {code}");
+                println!("     Send `{DISCORD_BIND_COMMAND} <code>` from your Discord account.");
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
         Self {
             bot_token,
             guild_id,
-            allowed_users,
+            allowed_users: Arc::new(RwLock::new(allowed_users)),
             listen_to_bots,
             mention_only,
             typing_handles: Mutex::new(HashMap::new()),
+            pairing,
         }
     }
 
@@ -41,17 +63,80 @@ impl DiscordChannel {
         crate::config::build_runtime_proxy_client("channel.discord")
     }
 
-    /// Check if a Discord user ID is in the allowlist.
-    /// Empty list means deny everyone until explicitly configured.
-    /// `"*"` means allow everyone.
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    async fn is_user_allowed(&self, user_id: &str) -> bool {
+        let users = self.allowed_users.read().await;
+        users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    async fn add_allowed_user(&self, user_id: &str) {
+        let mut users = self.allowed_users.write().await;
+        if !users.iter().any(|u| u == user_id) {
+            users.push(user_id.to_string());
+        }
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
-        // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
+    }
+
+    fn pairing_code_active(&self) -> bool {
+        self.pairing
+            .as_ref()
+            .is_some_and(|p| p.pairing_code().is_some())
+    }
+
+    async fn load_config_without_env() -> anyhow::Result<Config> {
+        let home = UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        let zeroclaw_dir = home.join(".zeroclaw");
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        let contents = fs::read_to_string(&config_path)
+            .await
+            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+        let mut config: Config = toml::from_str(&contents).context(
+            "Failed to parse config.toml — check [channels.discord] section for syntax errors",
+        )?;
+        config.config_path = config_path;
+        config.workspace_dir = zeroclaw_dir.join("workspace");
+        Ok(config)
+    }
+
+    async fn persist_allowed_user(&self, user_id: &str) -> anyhow::Result<()> {
+        let mut config = Self::load_config_without_env().await?;
+        let Some(discord) = config.channels_config.discord.as_mut() else {
+            anyhow::bail!(
+                "Missing [channels.discord] section in config.toml. \
+                Add bot_token and allowed_users under [channels.discord], \
+                or run `zeroclaw onboard --channels-only` to configure interactively"
+            );
+        };
+
+        if user_id.is_empty() {
+            anyhow::bail!("Cannot persist empty Discord user ID");
+        }
+
+        if !discord.allowed_users.iter().any(|u| u == user_id) {
+            discord.allowed_users.push(user_id.to_string());
+            config
+                .save()
+                .await
+                .context("Failed to persist Discord allowlist to config.toml")?;
+        }
+
+        Ok(())
+    }
+
+    fn extract_bind_code(text: &str) -> Option<String> {
+        let text = text.trim();
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if parts.len() == 2 && parts[0].eq_ignore_ascii_case(DISCORD_BIND_COMMAND) {
+            Some(parts[1].to_string())
+        } else {
+            None
+        }
     }
 }
 
@@ -413,21 +498,36 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+/// Normalize incoming message content.
+///
+/// When `mention_only` is true, only messages that @-mention the bot are processed.
+/// However, DM (Direct Message) conversations are exempt from this requirement —
+/// `mention_only` only applies to guild (server) messages.
+///
+/// # Arguments
+/// * `content` - The raw message content
+/// * `mention_only` - Whether to require @mention (only applies to guild messages)
+/// * `bot_user_id` - The bot's Discord user ID for mention detection
+/// * `is_dm` - Whether this message is from a DM channel (not a guild channel)
 fn normalize_incoming_content(
     content: &str,
     mention_only: bool,
     bot_user_id: &str,
+    is_dm: bool,
 ) -> Option<String> {
     if content.is_empty() {
         return None;
     }
 
-    if mention_only && !contains_bot_mention(content, bot_user_id) {
+    // mention_only only applies to guild messages, not DMs
+    let require_mention = mention_only && !is_dm;
+
+    if require_mention && !contains_bot_mention(content, bot_user_id) {
         return None;
     }
 
     let mut normalized = content.to_string();
-    if mention_only {
+    if require_mention {
         for tag in mention_tags(bot_user_id) {
             normalized = normalized.replace(&tag, " ");
         }
@@ -680,12 +780,6 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
-                    // Sender validation
-                    if !self.is_user_allowed(author_id) {
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
-                        continue;
-                    }
-
                     // Guild filter
                     if let Some(ref gid) = guild_filter {
                         let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
@@ -697,9 +791,100 @@ impl Channel for DiscordChannel {
                         }
                     }
 
+                    let is_authorized = self.is_user_allowed(author_id).await;
+
+                    if !is_authorized {
+                        let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let channel_id = d
+                            .get("channel_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        if let Some(code) = Self::extract_bind_code(content) {
+                            if let Some(pairing) = self.pairing.as_ref() {
+                                match pairing.try_pair(&code, author_id).await {
+                                    Ok(Some(_token)) => {
+                                        self.add_allowed_user(author_id).await;
+                                        match self.persist_allowed_user(author_id).await {
+                                            Ok(()) => {
+                                                let _ = self
+                                                    .send(&SendMessage::new(
+                                                        "✅ Discord account bound successfully. You can talk to ZeroClaw now.",
+                                                        &channel_id,
+                                                    ))
+                                                    .await;
+                                                tracing::info!(
+                                                    "Discord: paired and allowlisted user_id={author_id}"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Discord: failed to persist allowlist after bind: {e}"
+                                                );
+                                                let _ = self
+                                                    .send(&SendMessage::new(
+                                                        "⚠️ Bound for this runtime, but failed to persist config. Access may be lost after restart.",
+                                                        &channel_id,
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        let _ = self
+                                            .send(&SendMessage::new(
+                                                "❌ Invalid binding code. Ask operator for the latest code and retry.",
+                                                &channel_id,
+                                            ))
+                                            .await;
+                                    }
+                                    Err(lockout_secs) => {
+                                        let _ = self
+                                            .send(&SendMessage::new(
+                                                format!("⏳ Too many invalid attempts. Retry in {lockout_secs}s."),
+                                                &channel_id,
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            } else {
+                                let _ = self
+                                    .send(&SendMessage::new(
+                                        "ℹ️ Discord pairing is not active. Ask operator to add your user ID to channels.discord.allowed_users in config.toml.",
+                                        &channel_id,
+                                    ))
+                                    .await;
+                            }
+                        } else {
+                            tracing::warn!(
+                                "Discord: ignoring message from unauthorized user: {author_id}"
+                            );
+                            let _ = self
+                                .send(&SendMessage::new(
+                                    format!(
+                                        "🔐 This bot requires operator approval.\n\nCopy this command to operator terminal:\n`zeroclaw channel bind-discord {author_id}`\n\nAfter operator runs it, send your message again."
+                                    ),
+                                    &channel_id,
+                                ))
+                                .await;
+                            if self.pairing_code_active() {
+                                let _ = self
+                                    .send(&SendMessage::new(
+                                        format!("ℹ️ If operator provides a one-time pairing code, you can also run `{DISCORD_BIND_COMMAND} <code>`."),
+                                        &channel_id,
+                                    ))
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
+
+                    let is_dm = d.get("guild_id").is_none();
+
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
                     let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                        normalize_incoming_content(content, self.mention_only, &bot_user_id, is_dm)
                     else {
                         continue;
                     };
@@ -726,10 +911,11 @@ impl Channel for DiscordChannel {
                         .to_string();
 
                     if !message_id.is_empty() && !channel_id.is_empty() {
+                        let allowed_users_clone = self.allowed_users.read().await.clone();
                         let reaction_channel = DiscordChannel::new(
                             self.bot_token.clone(),
                             self.guild_id.clone(),
-                            self.allowed_users.clone(),
+                            allowed_users_clone,
                             self.listen_to_bots,
                             self.mention_only,
                         );
@@ -901,28 +1087,27 @@ mod tests {
 
     #[test]
     fn bot_user_id_extraction() {
-        // Token format: base64(user_id).timestamp.hmac
         let token = "MTIzNDU2.fake.hmac";
         let id = DiscordChannel::bot_user_id_from_token(token);
         assert_eq!(id, Some("123456".to_string()));
     }
 
-    #[test]
-    fn empty_allowlist_denies_everyone() {
+    #[tokio::test]
+    async fn empty_allowlist_denies_everyone() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
-        assert!(!ch.is_user_allowed("12345"));
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.is_user_allowed("12345").await);
+        assert!(!ch.is_user_allowed("anyone").await);
     }
 
-    #[test]
-    fn wildcard_allows_everyone() {
+    #[tokio::test]
+    async fn wildcard_allows_everyone() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
-        assert!(ch.is_user_allowed("12345"));
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.is_user_allowed("12345").await);
+        assert!(ch.is_user_allowed("anyone").await);
     }
 
-    #[test]
-    fn specific_allowlist_filters() {
+    #[tokio::test]
+    async fn specific_allowlist_filters() {
         let ch = DiscordChannel::new(
             "fake".into(),
             None,
@@ -930,28 +1115,28 @@ mod tests {
             false,
             false,
         );
-        assert!(ch.is_user_allowed("111"));
-        assert!(ch.is_user_allowed("222"));
-        assert!(!ch.is_user_allowed("333"));
-        assert!(!ch.is_user_allowed("unknown"));
+        assert!(ch.is_user_allowed("111").await);
+        assert!(ch.is_user_allowed("222").await);
+        assert!(!ch.is_user_allowed("333").await);
+        assert!(!ch.is_user_allowed("unknown").await);
     }
 
-    #[test]
-    fn allowlist_is_exact_match_not_substring() {
+    #[tokio::test]
+    async fn allowlist_is_exact_match_not_substring() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
-        assert!(!ch.is_user_allowed("1111"));
-        assert!(!ch.is_user_allowed("11"));
-        assert!(!ch.is_user_allowed("0111"));
+        assert!(!ch.is_user_allowed("1111").await);
+        assert!(!ch.is_user_allowed("11").await);
+        assert!(!ch.is_user_allowed("0111").await);
     }
 
-    #[test]
-    fn allowlist_empty_string_user_id() {
+    #[tokio::test]
+    async fn allowlist_empty_string_user_id() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
-        assert!(!ch.is_user_allowed(""));
+        assert!(!ch.is_user_allowed("").await);
     }
 
-    #[test]
-    fn allowlist_with_wildcard_and_specific() {
+    #[tokio::test]
+    async fn allowlist_with_wildcard_and_specific() {
         let ch = DiscordChannel::new(
             "fake".into(),
             None,
@@ -959,16 +1144,28 @@ mod tests {
             false,
             false,
         );
-        assert!(ch.is_user_allowed("111"));
-        assert!(ch.is_user_allowed("anyone_else"));
+        assert!(ch.is_user_allowed("111").await);
+        assert!(ch.is_user_allowed("anyone_else").await);
     }
 
-    #[test]
-    fn allowlist_case_sensitive() {
+    #[tokio::test]
+    async fn allowlist_case_sensitive() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
-        assert!(ch.is_user_allowed("ABC"));
-        assert!(!ch.is_user_allowed("abc"));
-        assert!(!ch.is_user_allowed("Abc"));
+        assert!(ch.is_user_allowed("ABC").await);
+        assert!(!ch.is_user_allowed("abc").await);
+        assert!(!ch.is_user_allowed("Abc").await);
+    }
+
+    #[tokio::test]
+    async fn pairing_enabled_with_empty_allowlist() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        assert!(ch.pairing_code_active());
+    }
+
+    #[tokio::test]
+    async fn pairing_disabled_with_nonempty_allowlist() {
+        let ch = DiscordChannel::new("fake".into(), None, vec!["12345".into()], false, false);
+        assert!(!ch.pairing_code_active());
     }
 
     #[test]
@@ -997,21 +1194,45 @@ mod tests {
     }
 
     #[test]
-    fn normalize_incoming_content_requires_mention_when_enabled() {
-        let cleaned = normalize_incoming_content("hello there", true, "12345");
+    fn normalize_guild_message_requires_mention_when_enabled() {
+        let cleaned = normalize_incoming_content("hello there", true, "12345", false);
         assert!(cleaned.is_none());
     }
 
     #[test]
-    fn normalize_incoming_content_strips_mentions_and_trims() {
-        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+    fn normalize_dm_message_ignores_mention_only() {
+        let cleaned = normalize_incoming_content("hello there", true, "12345", true);
+        assert_eq!(cleaned.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn normalize_strips_mentions_and_trims() {
+        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345", false);
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
     #[test]
-    fn normalize_incoming_content_rejects_empty_after_strip() {
-        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+    fn normalize_rejects_empty_after_strip() {
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345", false);
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_dm_passes_without_mention_even_when_mention_only_true() {
+        let cleaned = normalize_incoming_content("direct message", true, "12345", true);
+        assert_eq!(cleaned.as_deref(), Some("direct message"));
+    }
+
+    #[test]
+    fn normalize_guild_rejects_without_mention_when_mention_only_true() {
+        let cleaned = normalize_incoming_content("guild message", true, "12345", false);
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_guild_accepts_with_mention_when_mention_only_true() {
+        let cleaned = normalize_incoming_content("<@12345> guild message", true, "12345", false);
+        assert_eq!(cleaned.as_deref(), Some("guild message"));
     }
 
     // Message splitting tests

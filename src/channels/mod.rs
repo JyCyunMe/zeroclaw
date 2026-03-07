@@ -2513,6 +2513,68 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_discord_identity(value: &str) -> String {
+    value.trim().to_string()
+}
+
+async fn bind_discord_identity(config: &Config, identity: &str) -> Result<()> {
+    let normalized = normalize_discord_identity(identity);
+    if normalized.is_empty() {
+        anyhow::bail!("Discord user ID cannot be empty");
+    }
+
+    if !normalized.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!(
+            "Discord user ID must be numeric. Find your ID by enabling Developer Mode in Discord, \
+             right-clicking your username, and selecting \"Copy User ID\"."
+        );
+    }
+
+    let mut updated = config.clone();
+    let Some(discord) = updated.channels_config.discord.as_mut() else {
+        anyhow::bail!(
+            "Discord channel is not configured. Run `zeroclaw onboard --channels-only` first"
+        );
+    };
+
+    if discord.allowed_users.iter().any(|u| u == "*") {
+        println!(
+            "⚠️ Discord allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
+        );
+    }
+
+    if discord
+        .allowed_users
+        .iter()
+        .any(|entry| normalize_discord_identity(entry) == normalized)
+    {
+        println!("✅ Discord user ID already bound: {normalized}");
+        return Ok(());
+    }
+
+    discord.allowed_users.push(normalized.clone());
+    updated.save().await?;
+    println!("✅ Bound Discord user ID: {normalized}");
+    println!("   Saved to {}", updated.config_path.display());
+    match maybe_restart_managed_daemon_service() {
+        Ok(true) => {
+            println!("🔄 Detected running managed daemon service; reloaded automatically.");
+        }
+        Ok(false) => {
+            println!(
+                "ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
+                 Restart service manually with `zeroclaw service stop && zeroclaw service start`."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn maybe_restart_managed_daemon_service() -> Result<bool> {
     if cfg!(target_os = "macos") {
         let home = directories::UserDirs::new()
@@ -2654,6 +2716,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         }
         crate::ChannelCommands::BindTelegram { identity } => {
             bind_telegram_identity(config, &identity).await
+        }
+        crate::ChannelCommands::BindDiscord { identity } => {
+            bind_discord_identity(config, &identity).await
         }
     }
 }

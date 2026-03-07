@@ -136,6 +136,23 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Bind a Discord user ID into allowlist
+    #[command(long_about = "\
+Bind a Discord user ID into the allowlist.
+
+Adds a Discord numeric user ID to the channel allowlist so the \
+agent will respond to messages from that user.
+
+You can find your Discord user ID by enabling Developer Mode in \
+Discord settings, then right-clicking your username and selecting \
+\"Copy User ID\".
+
+Examples:
+  zeroclaw channel bind-discord 123456789012345678")]
+    BindDiscord {
+        /// Discord user ID to allow (numeric ID)
+        identity: String,
+    },
 }
 
 /// Skills management subcommands
