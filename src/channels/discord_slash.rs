@@ -21,7 +21,15 @@ pub mod types {
     }
 
     pub mod callback_type {
+        /// Respond to an interaction with a message.
+        /// Must be sent within 3 seconds of receiving the interaction.
         pub const CHANNEL_MESSAGE_WITH_SOURCE: i32 = 4;
+
+        /// ACK an interaction and edit a response later.
+        /// The user sees a loading state ("Bot is thinking...").
+        /// Must be sent within 3 seconds of receiving the interaction.
+        /// After deferring, you have up to 15 minutes to edit the response.
+        pub const DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE: i32 = 5;
     }
 }
 
